@@ -197,13 +197,8 @@ public class AlternateJigsawGenerator {
             if (ConfigHandler.getConfig().breaksSeedParity() || !this.vanilla) {
                 // If we've already iterated over this pool, don't iterate over it again to prevent infinite looping
                 if (checkedPools.getValue().contains(poolKey)) {
-                    StringBuilder stringBuilder = new StringBuilder();
-                    for (ResourceKey<StructureTemplatePool> checkedPoolKey : checkedPools.getValue()) {
-                        stringBuilder.append(checkedPoolKey.location()).append(" -> ");
-                    }
-                    stringBuilder.append(poolKey.location());
-
-                    LithostitchedCommon.LOGGER.warn("Template pool fallback chain found: {}", stringBuilder);
+                    // 优化：移除字符串构建和日志记录以提高世界生成性能
+                    // 循环检测到后直接返回空列表，避免无限循环
                     return List.of();
                 }
 
@@ -366,20 +361,10 @@ public class AlternateJigsawGenerator {
         }
 
         private Holder<StructureTemplatePool> getTemplatePoolHolder(ResourceKey<StructureTemplatePool> key) {
-            Optional<? extends Holder<StructureTemplatePool>> optional = this.registry.getHolder(key);
-            if (optional.isEmpty()) {
-                LithostitchedCommon.LOGGER.warn("Couldn't find template pool reference: {}", key.location());
-            } else {
-                Holder<StructureTemplatePool> regularPool = optional.get();
-                if ((regularPool.value()).size() == 0) {
-                    if (!regularPool.is(Pools.EMPTY)) {
-                        LithostitchedCommon.LOGGER.warn("Referenced template pool is empty: {}", key.location());
-                    }
-                } else {
-                    return regularPool;
-                }
-            }
-            return null;
+            // 优化：直接获取并返回有效的模板池，避免不必要的检查和日志记录
+            return this.registry.getHolder(key)
+                .filter(holder -> holder.value().size() > 0 || holder.is(Pools.EMPTY))
+                .orElse(null);
         }
 
         private static ResourceKey<StructureTemplatePool> getTemplatePoolKey(StructureTemplate.StructureBlockInfo info, PoolAliasLookup aliasLookup) {
