@@ -139,6 +139,10 @@ public class AlternateJigsawGenerator {
         private final Map<StructurePoolElement, Integer> groupCounts = new HashMap<>();
         final SequencedPriorityIterator<ShapedPoolStructurePiece> pieces = new SequencedPriorityIterator<>();
 
+        // 性能优化：缓存已验证的模板池状态，避免重复检查损坏的文件
+        private static final java.util.Set<ResourceKey<StructureTemplatePool>> validPools = java.util.concurrent.ConcurrentHashMap.newKeySet();
+        private static final java.util.Set<ResourceKey<StructureTemplatePool>> invalidPools = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
         private StructurePoolGenerator(Structure.GenerationContext context, boolean vanilla, Registry<StructureTemplatePool> registry, int maxSize, ChunkGenerator chunkGenerator, StructureTemplateManager structureTemplateManager, List<? super PoolElementStructurePiece> children, RandomSource random) {
             this.context = context;
             this.vanilla = vanilla;
@@ -205,31 +209,58 @@ public class AlternateJigsawGenerator {
                 checkedPools.getValue().add(poolKey);
 
                 // Get pool to get the elements, start with fallback pool if at max size
-                Holder<StructureTemplatePool> pool = this.registry.getHolder(poolKey).orElseThrow();
+                // 优化：使用安全的模板池获取，避免损坏文件导致异常
+                Holder<StructureTemplatePool> pool = getTemplatePoolHolder(poolKey);
+                if (pool == null) {
+                    return List.of();
+                }
 
                 // Skip straight to fallback if on max depth
                 if (depth == this.maxSize && firstIteration) {
                     pool = pool.value().getFallback();
                 }
 
-                return ((StructurePoolAccess)pool.value()).getLithostitchedTemplates().shuffle(random);
+                try {
+                    return ((StructurePoolAccess)pool.value()).getLithostitchedTemplates().shuffle(random);
+                } catch (Exception e) {
+                    // 如果获取模板时出错，缓存为无效并返回空列表
+                    invalidPools.add(poolKey);
+                    if (LithostitchedCommon.LOGGER.isDebugEnabled()) {
+                        LithostitchedCommon.LOGGER.debug("Error getting templates from pool, cached as invalid: {}", poolKey.location(), e);
+                    }
+                    return List.of();
+                }
             }
 
             if (!firstIteration) return List.of();
 
             // Get pool to get the elements, start with fallback pool if at max size
-            Holder<StructureTemplatePool> pool = this.registry.getHolder(poolKey).orElseThrow();
-            Holder<StructureTemplatePool> fallback = pool.value().getFallback();
-
-            List<StructurePoolElement> elements = new ArrayList<>();
-
-            if (depth != this.maxSize) {
-                elements.addAll(pool.value().getShuffledTemplates(this.random));
+            // 优化：使用安全的模板池获取，避免损坏文件导致异常
+            Holder<StructureTemplatePool> pool = getTemplatePoolHolder(poolKey);
+            if (pool == null) {
+                return List.of();
             }
 
-            elements.addAll(fallback.value().getShuffledTemplates(this.random));
+            try {
+                Holder<StructureTemplatePool> fallback = pool.value().getFallback();
 
-            return elements;
+                List<StructurePoolElement> elements = new ArrayList<>();
+
+                if (depth != this.maxSize) {
+                    elements.addAll(pool.value().getShuffledTemplates(this.random));
+                }
+
+                elements.addAll(fallback.value().getShuffledTemplates(this.random));
+
+                return elements;
+            } catch (Exception e) {
+                // 如果获取模板时出错，缓存为无效并返回空列表
+                invalidPools.add(poolKey);
+                if (LithostitchedCommon.LOGGER.isDebugEnabled()) {
+                    LithostitchedCommon.LOGGER.debug("Error getting vanilla templates from pool, cached as invalid: {}", poolKey.location(), e);
+                }
+                return List.of();
+            }
         }
 
         /**
@@ -361,10 +392,50 @@ public class AlternateJigsawGenerator {
         }
 
         private Holder<StructureTemplatePool> getTemplatePoolHolder(ResourceKey<StructureTemplatePool> key) {
-            // 优化：直接获取并返回有效的模板池，避免不必要的检查和日志记录
-            return this.registry.getHolder(key)
-                .filter(holder -> holder.value().size() > 0 || holder.is(Pools.EMPTY))
-                .orElse(null);
+            // 性能优化：使用缓存避免重复检查已知损坏的模板池
+            if (invalidPools.contains(key)) {
+                return null;
+            }
+
+            // 如果已知是有效的，直接获取
+            if (validPools.contains(key)) {
+                return this.registry.getHolder(key).orElse(null);
+            }
+
+            // 首次检查，添加异常处理以防止损坏的NBT文件影响性能
+            try {
+                Optional<? extends Holder<StructureTemplatePool>> optional = this.registry.getHolder(key);
+                if (optional.isEmpty()) {
+                    invalidPools.add(key);
+                    return null;
+                }
+
+                Holder<StructureTemplatePool> holder = optional.get();
+                try {
+                    // 安全检查模板池大小，捕获可能的NBT加载异常
+                    if (holder.value().size() > 0 || holder.is(Pools.EMPTY)) {
+                        validPools.add(key);
+                        return holder;
+                    } else {
+                        invalidPools.add(key);
+                        return null;
+                    }
+                } catch (Exception e) {
+                    // 如果模板池损坏，缓存为无效并跳过
+                    invalidPools.add(key);
+                    if (LithostitchedCommon.LOGGER.isDebugEnabled()) {
+                        LithostitchedCommon.LOGGER.debug("Corrupted template pool cached as invalid: {}", key.location(), e);
+                    }
+                    return null;
+                }
+            } catch (Exception e) {
+                // 如果整个获取过程失败，缓存为无效
+                invalidPools.add(key);
+                if (LithostitchedCommon.LOGGER.isDebugEnabled()) {
+                    LithostitchedCommon.LOGGER.debug("Failed to get template pool holder, cached as invalid: {}", key.location(), e);
+                }
+                return null;
+            }
         }
 
         private static ResourceKey<StructureTemplatePool> getTemplatePoolKey(StructureTemplate.StructureBlockInfo info, PoolAliasLookup aliasLookup) {
